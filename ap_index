@@ -1,0 +1,152 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from scipy.stats import pearsonr
+from scipy.signal import savgol_filter
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, LSTM, GRU, Dense, Dropout, LayerNormalization
+from tensorflow.keras.callbacks import EarlyStopping
+import warnings
+warnings.filterwarnings('ignore')
+
+# --- Load and Preprocess Data ---
+df = pd.read_csv("ap_index4.csv")
+df.columns = df.columns.str.strip()
+df['daily_ap_index'] = savgol_filter(df['daily_ap_index'], window_length=11, polyorder=3)
+df['date'] = pd.to_datetime(df['date'])
+df = df[['date', 'daily_ap_index']].dropna()
+df.set_index('date', inplace=True)
+
+# Normalize
+scaler = MinMaxScaler()
+data_scaled = scaler.fit_transform(df[['daily_ap_index']])
+
+# --- Create Sequences ---
+def create_sequences(data, seq_len=60):
+    X, y = [], []
+    for i in range(len(data) - seq_len):
+        X.append(data[i:i + seq_len])
+        y.append(data[i + seq_len])
+    return np.array(X), np.array(y)
+
+sequence_length = 60
+X, y = create_sequences(data_scaled, sequence_length)
+
+# Split
+train_size = int(len(X) * 0.8)
+X_train, y_train = X[:train_size], y[:train_size]
+X_test, y_test = X[train_size:], y[train_size:]
+
+# --- Build Model ---
+input_layer = Input(shape=(sequence_length, 1))
+x = LSTM(128, return_sequences=True)(input_layer)
+x = LayerNormalization()(x)
+x = Dropout(0.2)(x)
+x = GRU(128, return_sequences=True)(x)
+x = LayerNormalization()(x)
+x = Dropout(0.2)(x)
+x = LSTM(128)(x)
+x = Dropout(0.2)(x)
+output_layer = Dense(1)(x)
+
+model = Model(inputs=input_layer, outputs=output_layer)
+model.compile(optimizer='adam', loss='mse')
+model.summary()
+
+# --- Train Model ---
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_test, y_test),
+    epochs=100,
+    batch_size=16,
+    callbacks=[EarlyStopping(patience=20, restore_best_weights=True)],
+    verbose=1
+)
+
+# --- Predictions ---
+y_pred_test = model.predict(X_test)
+y_pred_test_inv = scaler.inverse_transform(y_pred_test)
+y_test_inv = scaler.inverse_transform(y_test)
+
+# --- Forecast Future ---
+last_seq = X[-1].reshape(1, sequence_length, 1)
+future_steps = 10
+future_preds = []
+
+for _ in range(future_steps):
+    pred = model.predict(last_seq)[0]
+    future_preds.append(pred)
+    last_seq = np.append(last_seq[:, 1:, :], [[pred]], axis=1)
+
+future_preds_inv = scaler.inverse_transform(np.array(future_preds).reshape(-1, 1))
+
+# --- Evaluation Metrics ---
+residuals = y_test_inv.flatten() - y_pred_test_inv.flatten()
+std_dev = np.std(residuals)
+rmse = np.sqrt(mean_squared_error(y_test_inv, y_pred_test_inv))
+mae = mean_absolute_error(y_test_inv, y_pred_test_inv)
+r2 = r2_score(y_test_inv, y_pred_test_inv)
+nrmse = rmse / (np.max(y_test_inv) - np.min(y_test_inv))
+mbe = np.mean(residuals)
+test_stat = np.mean(np.abs(residuals) / std_dev)
+pearson_r, _ = pearsonr(y_test_inv.flatten(), y_pred_test_inv.flatten())
+
+# --- Display Evaluation Metrics ---
+print("\n--- Evaluation Metrics ---")
+print(f"RMSE           : {rmse:.3f}")
+print(f"MAE            : {mae:.3f}")
+print(f"MBE            : {mbe:.3f}")
+print(f"NRMSE          : {nrmse:.3f}")
+print(f"Standard Dev   : {std_dev:.3f}")
+print(f"Test Statistic : {test_stat:.3f}")
+print(f"R^2 Score      : {r2:.3f}")
+print(f"Pearson r      : {pearson_r:.3f}")
+
+# --- Sample Actual vs Predicted Values ---
+print("\n--- Sample Actual vs Predicted Values ---")
+for actual, pred in zip(y_test_inv[:10], y_pred_test_inv[:10]):
+    print(f"Actual: {actual[0]:.3f} | Predicted: {pred[0]:.3f}")
+
+# --- Plot Actual vs Predicted ---
+plt.figure(figsize=(14, 6))
+plt.plot(df.index[-len(y_test):], y_test_inv, label='Actual (Test)', color='royalblue')
+plt.plot(df.index[-len(y_test):], y_pred_test_inv, label='Prediction (Test)', color='orange', linestyle='--')
+
+future_index = pd.date_range(start=df.index[-1], periods=future_steps + 1, freq='3H')[1:]
+plt.plot(future_index, future_preds_inv, label='Future Forecast', color='green')
+plt.fill_between(future_index,
+                 (future_preds_inv - std_dev).flatten(),
+                 (future_preds_inv + std_dev).flatten(),
+                 color='lightgreen', alpha=0.4, label='±1σ Uncertainty')
+
+plt.axvline(df.index[-1], color='gray', linestyle=':', label='Forecast Start')
+plt.title("AI-Based AP Index Prediction (LSTM + GRU)", fontsize=16, fontweight='bold')
+plt.xlabel("Date")
+plt.ylabel("AP Index")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# --- Heatmap of Rolling RMSE ---
+window_size = 10
+rolling_rmse = []
+for i in range(0, len(y_test_inv) - window_size + 1):
+    y_true_window = y_test_inv[i:i+window_size]
+    y_pred_window = y_pred_test_inv[i:i+window_size]
+    rmse_window = np.sqrt(mean_squared_error(y_true_window, y_pred_window))
+    rolling_rmse.append(rmse_window)
+
+rolling_rmse_reshaped = np.array(rolling_rmse).reshape(1, -1)
+
+plt.figure(figsize=(14, 2))
+sns.heatmap(rolling_rmse_reshaped, cmap='coolwarm', cbar_kws={'label': 'RMSE'})
+plt.title(f'Heatmap of Rolling RMSE (Window Size: {window_size})', fontsize=16, fontweight='bold')
+plt.yticks([])
+plt.xlabel('Window Start Index', fontsize=14)
+plt.tight_layout()
+plt.show()
